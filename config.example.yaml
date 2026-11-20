@@ -1,0 +1,52 @@
+# late-stream schedule. Copy to schedule.yaml and edit.
+# Start times MUST include a UTC offset (e.g. +07:00) or "Z".
+# The daemon re-reads this file every 30 s, so you can add tomorrow's jobs
+# while it is running.
+
+youtube:
+  client_secrets: ./client_secret.json   # OAuth "Desktop app" client from Google Cloud Console
+  token_file: ./token.json               # created by `late-stream auth`
+
+state_file: ./state.json
+log_dir: ./logs
+
+# Applied to every job unless the job overrides it.
+defaults:
+  privacy: unlisted          # public | unlisted | private
+  latency: normal            # normal | low | ultraLow  (normal = best quality, DVR works)
+  enable_dvr: true
+  made_for_kids: false
+  auto_start: true           # YouTube goes live as soon as video arrives
+  auto_stop: true
+  announce_minutes: 60       # create the YouTube event this long before start
+  max_late_minutes: 15       # skip a job if the machine was down past this
+  ingest_stream: late-stream-main   # reusable stream key; overlapping jobs need different names
+  encoder:
+    video_encoder: libx264   # libx264 | h264_nvenc | h264_qsv | h264_videotoolbox
+    # height: 1080           # downscale (e.g. 4K ProRes -> 1080p) to save CPU/bandwidth
+    # video_bitrate_kbps: 9000
+    keyframe_seconds: 2
+    audio_bitrate_kbps: 128
+    # audio_streams: [0, 1]  # merge two mono tracks (typical ProRes from cameras) into stereo
+    # force_transcode: false
+
+jobs:
+  - id: 2026-11-21-a
+    file: /mnt/recordings/2026-11-20_session1.mov
+    start: 2026-11-21T09:00:00+07:00
+    title: "Session 1 (recorded)"
+    description: "Recorded on 20 Nov, streamed live."
+    # thumbnail: ./thumbs/session1.jpg
+
+  - id: 2026-11-21-b
+    file: /mnt/recordings/2026-11-20_session2.mov
+    start: 2026-11-21T13:00:00+07:00
+    title: "Session 2 (recorded)"
+
+  - id: 2026-11-21-c
+    file: /mnt/recordings/2026-11-20_session3.mp4
+    start: 2026-11-21T19:00:00+07:00
+    title: "Session 3 (recorded)"
+    privacy: public
+    encoder:
+      video_encoder: h264_nvenc

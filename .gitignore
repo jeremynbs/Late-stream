@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.pytest_cache/
+# secrets / runtime state
+client_secret*.json
+token*.json
+state.json
+logs/
+*.flv
