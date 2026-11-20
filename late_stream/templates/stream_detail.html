@@ -1,0 +1,36 @@
+{% extends "base.html" %}{% block body %}
+<div class="row"><h1 class="grow">{{ s.name }}</h1>
+<span class="badge b-{{ s.status }}">{{ STATUS_LABEL.get(s.status, s.status) }}</span></div>
+<div class="card">
+<table>
+<tr><th>File</th><td class="mono">{{ s.nas_path }} {% if s.file_size %}<span class="muted">({{ human_size(s.file_size) }})</span>{% endif %}</td></tr>
+<tr><th>Start</th><td>{{ local(s.start_utc) }}</td></tr>
+<tr><th>Length</th><td>{{ hms(s.duration) if s.duration else '—' }}</td></tr>
+<tr><th>Progress</th><td><span id="pg">{{ hms(s.position) }}</span> {% if s.speed %}<span class="muted">speed {{ s.speed }}</span>{% endif %} · reconnects: {{ s.restarts }}</td></tr>
+<tr><th>Destination</th><td class="mono">{{ s.rtmp_url }}/{{ mask(s.stream_key) }}</td></tr>
+<tr><th>YouTube</th><td>{% if s.youtube_video_id %}<a href="https://youtu.be/{{ s.youtube_video_id }}" target="_blank" rel="noopener">youtu.be/{{ s.youtube_video_id }}</a>{% else %}<span class="muted">not linked</span>{% endif %}
+ {% if s.unlist_after %}<span class="muted">· set to unlisted after the stream</span>{% endif %}</td></tr>
+<tr><th>Started / ended</th><td>{{ local(s.started_at) or '—' }} / {{ local(s.ended_at) or '—' }}</td></tr>
+<tr><th>Message</th><td>{{ s.message }}</td></tr>
+</table>
+<p class="row">
+{% if running %}
+  <form class="inline" method="post" action="{{ url_for('stream_stop', sid=s.id) }}" onsubmit="return confirm('Stop this live stream?')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="danger">Stop stream</button></form>
+{% else %}
+  {% if s.status in ('scheduled','ready','check_failed') %}
+    <a class="btn" href="{{ url_for('stream_edit', sid=s.id) }}">Edit</a>
+    <form class="inline" method="post" action="{{ url_for('stream_start', sid=s.id) }}" onsubmit="return confirm('Start streaming NOW?')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button>Start now</button></form>
+  {% endif %}
+  {% if s.status in ('failed','stopped','interrupted') and s.position %}
+    <form class="inline" method="post" action="{{ url_for('stream_resume', sid=s.id) }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="primary">Resume at {{ hms(s.position) }}</button></form>
+  {% endif %}
+  <form class="inline" method="post" action="{{ url_for('stream_check', sid=s.id) }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button>Check file</button></form>
+  <a class="btn" href="{{ url_for('stream_new', copy=s.id) }}">Duplicate</a>
+{% endif %}
+</p></div>
+<div class="card"><h2>Events</h2>
+{% if events %}<table>{% for e in events %}<tr><td class="muted" style="white-space:nowrap">{{ local(e.ts) }}</td><td><span class="badge">{{ e.level }}</span></td><td>{{ e.message }}</td></tr>{% endfor %}</table>
+{% else %}<p class="muted">No events yet.</p>{% endif %}</div>
+{% if ffmpeg_log %}<div class="card"><h2>Encoder log (latest)</h2><pre>{{ ffmpeg_log }}</pre></div>{% endif %}
+{% endblock %}
+{% block scripts %}{% if running %}<script>setTimeout(()=>location.reload(),10000)</script>{% endif %}{% endblock %}

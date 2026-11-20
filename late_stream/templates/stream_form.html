@@ -1,0 +1,62 @@
+{% extends "base.html" %}{% block body %}
+<h1>{{ 'Edit stream' if s.id else 'New stream' }}</h1>
+<form method="post" action="{{ url_for('stream_save', sid=s.id) if s.id else url_for('stream_save') }}" autocomplete="off">
+<input type="hidden" name="csrf" value="{{ csrf_token() }}">
+{% if copy_id %}<input type="hidden" name="copy_id" value="{{ copy_id }}">{% endif %}
+<div class="card"><h2>What</h2>
+  <label>Name</label><input type="text" name="name" value="{{ s.name }}" required placeholder="e.g. Morning session – 21 Nov">
+  <label>Video file on the NAS</label>
+  <div class="row"><input class="grow mono" type="text" name="nas_path" id="nas_path" value="{{ s.nas_path }}" required placeholder="/video/recordings/session1.mov" style="flex:1">
+  <button type="button" onclick="openBrowser()">Browse…</button></div>
+  {% if s.message and s.status in ('ready','check_failed') %}<p class="muted">Last check: {{ s.message }}</p>{% endif %}
+</div>
+<div class="card"><h2>When</h2>
+  <div class="grid2">
+    <div><label>Date</label><input type="date" name="date" value="{{ date_s }}" required></div>
+    <div><label>Start time ({{ tzname }})</label><input type="time" name="time" step="1" value="{{ time_s }}" required></div>
+  </div>
+  <p class="muted">Streaming starts exactly at this time. Change the time zone in Settings.</p>
+</div>
+<div class="card"><h2>Where (YouTube)</h2>
+  <p class="muted">Create the stream in YouTube Studio (title, thumbnail, <b>Public</b>, with <b>Auto-start</b> and <b>Auto-stop</b> on), then copy its stream URL and key here.</p>
+  <label>Stream URL</label><input class="mono" type="text" name="rtmp_url" value="{{ s.rtmp_url }}" required>
+  <label>Stream key</label>
+  <input class="mono" type="password" name="stream_key" placeholder="{{ (mask(s.stream_key) ~ '  (leave empty to keep)') if s.stream_key else 'xxxx-xxxx-xxxx-xxxx-xxxx' }}" {{ '' if s.stream_key else 'required' }}>
+  <label>YouTube video link <span class="muted">(optional)</span></label>
+  <input class="mono" type="text" name="youtube_video" value="{{ s.youtube_video_id }}" placeholder="https://youtube.com/live/… — found automatically from the stream key if empty">
+  <label class="check"><input type="checkbox" name="unlist_after" {{ 'checked' if s.unlist_after }}> Change the video to <b>Unlisted</b> when the stream ends <span class="muted">(needs YouTube connected in Settings)</span></label>
+</div>
+<div class="row"><button class="primary">Save</button><a class="btn" href="{{ url_for('index') }}">Cancel</a>
+{% if s.id %}<span class="grow"></span>{% endif %}</div>
+</form>
+{% if s.id %}
+<form method="post" action="{{ url_for('stream_delete', sid=s.id) }}" onsubmit="return confirm('Delete this stream?')" style="margin-top:20px">
+<input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="danger">Delete stream</button></form>
+{% endif %}
+
+<dialog id="fb">
+  <div class="hd"><button type="button" class="small" id="fb-up">↑ Up</button><span class="mono grow" id="fb-path"></span>
+  <button type="button" class="small" onclick="document.getElementById('fb').close()">Close</button></div>
+  <div class="bd" id="fb-list"><p style="padding:16px" class="muted">Loading…</p></div>
+</dialog>
+{% endblock %}
+{% block scripts %}<script>
+const fb=document.getElementById('fb'), list=document.getElementById('fb-list');
+function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function load(path){
+  list.innerHTML='<p style="padding:16px" class="muted">Loading…</p>';
+  const r=await fetch('/api/nas/list'+(path?('?path='+encodeURIComponent(path)):''));
+  const d=await r.json();
+  if(!r.ok){list.innerHTML=`<p style="padding:16px" class="flash error">${esc(d.error||'error')}</p>`;return;}
+  document.getElementById('fb-path').textContent=d.path;
+  const up=document.getElementById('fb-up'); up.disabled=!d.parent; up.onclick=()=>load(d.parent);
+  if(!d.entries.length){list.innerHTML='<p style="padding:16px" class="muted">No folders or video files here.</p>';return;}
+  list.innerHTML=d.entries.map((e,i)=>`<div class="fe" data-i="${i}"><span>${e.is_dir?'📁':'🎬'}</span><span class="grow">${esc(e.name)}</span><span class="muted">${e.is_dir?'':e.size_h}</span></div>`).join('');
+  list.querySelectorAll('.fe').forEach(el=>el.onclick=()=>{const e=d.entries[+el.dataset.i];
+    if(e.is_dir) load(e.path); else {document.getElementById('nas_path').value=e.path; fb.close();}});
+}
+function openBrowser(){
+  const cur=document.getElementById('nas_path').value; fb.showModal();
+  load(cur && cur.includes('/') ? cur.substring(0,cur.lastIndexOf('/'))||'/' : '');
+}
+</script>{% endblock %}

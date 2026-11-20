@@ -1,90 +1,112 @@
-"""Thin wrapper around the YouTube Data API v3 Live Streaming endpoints.
+"""Optional YouTube Data API v3 integration.
 
-Quota cost of each call (default project quota is 10,000 units/day) is noted
-next to every method; see README "API cost".
+The stream itself only needs the RTMP URL + stream key. The API is used only
+for things a stream key can't do:
+
+* find the broadcast (video) that the stream key is bound to,
+* make sure it goes live if "Auto-start" was left off in YouTube Studio,
+* end it, and switch it from public to **unlisted** after the stream.
+
+Quota cost per stream is ~60 units of the free 10,000/day (see README).
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
+import urllib.parse
 
 log = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/youtube"]
-
 QUOTA = {
-    "liveBroadcasts.insert": 50,
-    "liveBroadcasts.update": 50,
-    "liveBroadcasts.bind": 50,
-    "liveBroadcasts.transition": 50,
-    "liveBroadcasts.delete": 50,
-    "liveBroadcasts.list": 1,
-    "liveStreams.insert": 50,
-    "liveStreams.update": 50,
-    "liveStreams.delete": 50,
-    "liveStreams.list": 1,
-    "thumbnails.set": 50,
-    "videos.update": 50,
+    "liveStreams.list": 1, "liveBroadcasts.list": 1, "liveBroadcasts.transition": 50,
+    "videos.list": 1, "videos.update": 50, "channels.list": 1,
 }
+# Fields videos.update(part=status) accepts. Anything we don't send is reset,
+# so we copy the current values back.
+WRITABLE_STATUS = ("privacyStatus", "embeddable", "license", "publicStatsViewable",
+                   "selfDeclaredMadeForKids", "containsSyntheticMedia")
+
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 
 class YouTubeError(RuntimeError):
     pass
 
 
-def load_credentials(client_secrets: Path, token_file: Path, interactive: bool = True):
-    """OAuth 2.0 'installed app' flow. First run opens a browser (or prints a
-    URL); the refresh token is cached in ``token_file`` for unattended use."""
+# ---------------------------------------------------------------- OAuth
+def parse_client_json(text: str) -> dict:
+    try:
+        cfg = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise YouTubeError("OAuth client file is not valid JSON") from e
+    if not ({"installed", "web"} & set(cfg)):
+        raise YouTubeError("not an OAuth client file (expected an 'installed' or 'web' key); "
+                           "download it from Google Cloud Console > Credentials")
+    return cfg
+
+
+def start_auth(client_json: str, redirect_uri: str) -> tuple[str, dict]:
+    """Return (consent URL, pending state to keep until the callback)."""
+    from google_auth_oauthlib.flow import Flow
+    flow = Flow.from_client_config(parse_client_json(client_json), SCOPES,
+                                   redirect_uri=redirect_uri)
+    url, state = flow.authorization_url(access_type="offline", prompt="consent",
+                                        include_granted_scopes="true")
+    return url, {"state": state, "verifier": flow.code_verifier, "redirect_uri": redirect_uri}
+
+
+def finish_auth(client_json: str, pending: dict, callback_url_or_code: str) -> str:
+    """Exchange the code (or the full redirected URL the user pasted) for a
+    token. Returns the token JSON to store."""
+    from google_auth_oauthlib.flow import Flow
+    text = callback_url_or_code.strip()
+    code = text
+    if "code=" in text:
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(text).query)
+        if q.get("state", [pending.get("state")])[0] != pending.get("state"):
+            raise YouTubeError("OAuth state mismatch; start the connection again")
+        if "error" in q:
+            raise YouTubeError(f"Google returned an error: {q['error'][0]}")
+        code = q["code"][0]
+    flow = Flow.from_client_config(parse_client_json(client_json), SCOPES,
+                                   redirect_uri=pending["redirect_uri"],
+                                   code_verifier=pending.get("verifier"),
+                                   autogenerate_code_verifier=False)
+    try:
+        flow.fetch_token(code=code)
+    except Exception as e:
+        raise YouTubeError(f"could not get token from Google: {e}") from e
+    if not flow.credentials.refresh_token:
+        raise YouTubeError("Google did not return a refresh token; remove the app's access at "
+                           "myaccount.google.com/permissions and connect again")
+    return flow.credentials.to_json()
+
+
+def build_client(token_json: str, on_refresh=None) -> "YouTube":
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
-
-    creds = None
-    if token_file.exists():
-        creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
-    if creds and creds.valid:
-        return creds
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    else:
-        if not interactive:
-            raise YouTubeError(
-                f"No valid token in {token_file}. Run `late-stream auth` first.")
-        if not client_secrets.exists():
-            raise YouTubeError(f"OAuth client file not found: {client_secrets}")
-        flow = InstalledAppFlow.from_client_secrets_file(str(client_secrets), SCOPES)
-        creds = flow.run_local_server(port=0, open_browser=True)
-    token_file.parent.mkdir(parents=True, exist_ok=True)
-    token_file.write_text(creds.to_json())
-    try:
-        token_file.chmod(0o600)
-    except OSError:
-        pass
-    return creds
-
-
-def build_service(creds):
     from googleapiclient.discovery import build
-    return build("youtube", "v3", credentials=creds, cache_discovery=False)
+    if not token_json:
+        raise YouTubeError("YouTube is not connected")
+    creds = Credentials.from_authorized_user_info(json.loads(token_json), SCOPES)
+    if not creds.valid:
+        try:
+            creds.refresh(Request())
+        except Exception as e:
+            raise YouTubeError(
+                f"YouTube token refresh failed ({e}). If the Google Cloud OAuth app is in "
+                "'Testing' mode tokens expire after 7 days - publish it, then reconnect.") from e
+        if on_refresh:
+            on_refresh(creds.to_json())
+    return YouTube(build("youtube", "v3", credentials=creds, cache_discovery=False))
 
 
-@dataclass
-class IngestInfo:
-    stream_id: str
-    url: str  # full RTMPS URL including stream key - keep secret
-
-
-def _iso(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        raise ValueError("datetime must be timezone-aware")
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-
-class YouTubeLive:
+# ---------------------------------------------------------------- API calls
+class YouTube:
     def __init__(self, service):
         self.yt = service
         self.units_used = 0
@@ -93,130 +115,154 @@ class YouTubeLive:
         from googleapiclient.errors import HttpError
         self.units_used += QUOTA.get(method, 1)
         delay = 2.0
-        for attempt in range(5):
+        for attempt in range(4):
             try:
                 return request.execute()
             except HttpError as e:
                 status = getattr(e.resp, "status", 0)
-                if status in (500, 502, 503, 504) and attempt < 4:
-                    log.warning("%s -> HTTP %s, retrying in %.0fs", method, status, delay)
+                if status in (500, 502, 503, 504) and attempt < 3:
                     time.sleep(delay)
                     delay *= 2
                     continue
-                raise YouTubeError(f"{method} failed: {e}") from e
-        raise YouTubeError(f"{method} failed after retries")
+                raise YouTubeError(f"{method} failed: {_reason(e)}") from e
 
-    # ---------------- streams (ingest points) ----------------
-    def get_or_create_stream(self, title: str) -> IngestInfo:
-        """Reusable ingest stream identified by title. Reusing it means the
-        stream key never changes and saves 50 units per broadcast."""
+    def channel_title(self) -> str:
+        r = self._exec("channels.list", self.yt.channels().list(part="snippet", mine=True))
+        items = r.get("items", [])
+        return items[0]["snippet"]["title"] if items else "(no channel)"
+
+    def stream_id_for_key(self, stream_key: str) -> str | None:
         page = None
         while True:
-            resp = self._exec("liveStreams.list", self.yt.liveStreams().list(
-                part="id,snippet,cdn,status", mine=True, maxResults=50, pageToken=page))
-            for item in resp.get("items", []):
-                if item["snippet"]["title"] == title:
-                    return self._ingest(item)
-            page = resp.get("nextPageToken")
+            r = self._exec("liveStreams.list", self.yt.liveStreams().list(
+                part="id,cdn", mine=True, maxResults=50, pageToken=page))
+            for item in r.get("items", []):
+                if item.get("cdn", {}).get("ingestionInfo", {}).get("streamName") == stream_key:
+                    return item["id"]
+            page = r.get("nextPageToken")
             if not page:
-                break
-        body = {
-            "snippet": {"title": title},
-            "cdn": {"ingestionType": "rtmp", "resolution": "variable",
-                    "frameRate": "variable"},
-            "contentDetails": {"isReusable": True},
-        }
-        item = self._exec("liveStreams.insert", self.yt.liveStreams().insert(
-            part="snippet,cdn,contentDetails,status", body=body))
-        log.info("created live stream '%s' (%s)", title, item["id"])
-        return self._ingest(item)
+                return None
 
-    @staticmethod
-    def _ingest(item: dict) -> IngestInfo:
-        ing = item["cdn"]["ingestionInfo"]
-        base = ing.get("rtmpsIngestionAddress") or ing["ingestionAddress"]
-        return IngestInfo(stream_id=item["id"], url=f"{base}/{ing['streamName']}")
+    def find_broadcast(self, stream_key: str,
+                       statuses=("active", "upcoming")) -> str | None:
+        """Video id of the active (or else next upcoming) broadcast bound to
+        this stream key."""
+        sid = self.stream_id_for_key(stream_key)
+        if not sid:
+            return None
+        for status in statuses:
+            r = self._exec("liveBroadcasts.list", self.yt.liveBroadcasts().list(
+                part="id,snippet,contentDetails", broadcastStatus=status,
+                broadcastType="all", maxResults=50))
+            matches = [b for b in r.get("items", [])
+                       if b.get("contentDetails", {}).get("boundStreamId") == sid]
+            if matches:
+                # upcoming: the soonest; completed: the most recent
+                matches.sort(key=lambda b: b["snippet"].get("scheduledStartTime", ""),
+                             reverse=(status == "completed"))
+                return matches[0]["id"]
+        return None
 
-    def stream_status(self, stream_id: str) -> tuple[str, str]:
-        resp = self._exec("liveStreams.list", self.yt.liveStreams().list(
-            part="status", id=stream_id))
-        items = resp.get("items", [])
+    def broadcast(self, video_id: str) -> dict:
+        r = self._exec("liveBroadcasts.list", self.yt.liveBroadcasts().list(
+            part="id,status,contentDetails", id=video_id))
+        items = r.get("items", [])
         if not items:
-            raise YouTubeError(f"stream {stream_id} not found")
-        st = items[0]["status"]
-        return st.get("streamStatus", ""), st.get("healthStatus", {}).get("status", "")
+            raise YouTubeError(f"broadcast {video_id} not found on this channel")
+        return items[0]
 
-    # ---------------- broadcasts (the event viewers see) ----------------
-    def create_broadcast(self, *, title: str, description: str, start: datetime,
-                         privacy: str = "unlisted", auto_start: bool = True,
-                         auto_stop: bool = True, latency: str = "normal",
-                         enable_dvr: bool = True, made_for_kids: bool = False,
-                         category_id: str | None = None) -> dict:
-        body = {
-            "snippet": {"title": title[:100], "description": description[:5000],
-                        "scheduledStartTime": _iso(start)},
-            "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": made_for_kids},
-            "contentDetails": {
-                "enableAutoStart": auto_start,
-                "enableAutoStop": auto_stop,
-                "enableDvr": enable_dvr,
-                "latencyPreference": latency,
-                # Without monitor stream we can go straight ready -> live.
-                "monitorStream": {"enableMonitorStream": False},
-            },
-        }
-        b = self._exec("liveBroadcasts.insert", self.yt.liveBroadcasts().insert(
-            part="snippet,status,contentDetails", body=body))
-        log.info("created broadcast %s https://youtu.be/%s", b["id"], b["id"])
-        if category_id:
-            # Category lives on the underlying video resource.
-            self._exec("videos.update", self.yt.videos().update(
-                part="snippet", body={"id": b["id"], "snippet": {
-                    "title": title[:100], "description": description[:5000],
-                    "categoryId": category_id}}))
-        return b
+    def lifecycle(self, video_id: str) -> str:
+        return self.broadcast(video_id)["status"]["lifeCycleStatus"]
 
-    def bind(self, broadcast_id: str, stream_id: str) -> None:
-        self._exec("liveBroadcasts.bind", self.yt.liveBroadcasts().bind(
-            part="id,contentDetails", id=broadcast_id, streamId=stream_id))
-
-    def broadcast_status(self, broadcast_id: str) -> str:
-        resp = self._exec("liveBroadcasts.list", self.yt.liveBroadcasts().list(
-            part="status", id=broadcast_id))
-        items = resp.get("items", [])
-        if not items:
-            raise YouTubeError(f"broadcast {broadcast_id} not found")
-        return items[0]["status"]["lifeCycleStatus"]
-
-    def transition(self, broadcast_id: str, status: str) -> None:
+    def transition(self, video_id: str, to: str) -> None:
         self._exec("liveBroadcasts.transition", self.yt.liveBroadcasts().transition(
-            part="status", id=broadcast_id, broadcastStatus=status))
-        log.info("broadcast %s -> %s", broadcast_id, status)
+            part="status", id=video_id, broadcastStatus=to))
+        log.info("broadcast %s -> %s", video_id, to)
 
-    def set_thumbnail(self, broadcast_id: str, image: Path) -> None:
-        from googleapiclient.http import MediaFileUpload
-        self._exec("thumbnails.set", self.yt.thumbnails().set(
-            videoId=broadcast_id, media_body=MediaFileUpload(str(image))))
+    def ensure_live(self, video_id: str, timeout: float = 120) -> str:
+        """If Auto-start is off in Studio, move the broadcast to live."""
+        b = self.broadcast(video_id)
+        status = b["status"]["lifeCycleStatus"]
+        if status in ("live", "liveStarting"):
+            return status
+        if status == "ready":
+            monitor = b.get("contentDetails", {}).get("monitorStream", {}) \
+                .get("enableMonitorStream", False)
+            if monitor:
+                self.transition(video_id, "testing")
+                status = self._wait(video_id, {"testing"}, timeout)
+            else:
+                self.transition(video_id, "live")
+                return self._wait(video_id, {"live"}, timeout)
+        if status == "testing":
+            self.transition(video_id, "live")
+            return self._wait(video_id, {"live"}, timeout)
+        return status
 
-    # ---------------- helpers ----------------
-    def wait_stream_active(self, stream_id: str, timeout: float = 120,
-                           poll: float = 5) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            status, health = self.stream_status(stream_id)
-            log.info("ingest stream status=%s health=%s", status, health)
-            if status == "active":
-                return True
-            time.sleep(poll)
-        return False
+    def complete(self, video_id: str) -> str:
+        status = self.lifecycle(video_id)
+        if status in ("live", "liveStarting", "testing"):
+            self.transition(video_id, "complete")
+            status = "complete"
+        return status
 
-    def wait_broadcast(self, broadcast_id: str, wanted: set[str], timeout: float = 120,
-                       poll: float = 5) -> str:
+    def wait_complete(self, video_id: str, timeout: float = 90) -> str:
+        """With Auto-stop on, YouTube ends the broadcast by itself shortly
+        after video stops. Wait a bit for that, then end it ourselves."""
+        status = self._wait(video_id, {"complete", "revoked"}, timeout)
+        if status not in ("complete", "revoked"):
+            status = self.complete(video_id)
+        return status
+
+    def set_privacy(self, video_id: str, privacy: str) -> None:
+        r = self._exec("videos.list", self.yt.videos().list(part="status", id=video_id))
+        items = r.get("items", [])
+        if not items:
+            raise YouTubeError(f"video {video_id} not found")
+        current = items[0]["status"]
+        if current.get("privacyStatus") == privacy:
+            return
+        status = {k: current[k] for k in WRITABLE_STATUS if k in current}
+        status["privacyStatus"] = privacy
+        self._exec("videos.update", self.yt.videos().update(
+            part="status", body={"id": video_id, "status": status}))
+        log.info("video %s set to %s", video_id, privacy)
+
+    def _wait(self, video_id: str, wanted: set[str], timeout: float, poll: float = 10) -> str:
         deadline = time.monotonic() + timeout
         status = ""
-        while time.monotonic() < deadline:
-            status = self.broadcast_status(broadcast_id)
-            if status in wanted:
+        while True:
+            status = self.lifecycle(video_id)
+            if status in wanted or time.monotonic() >= deadline:
                 return status
             time.sleep(poll)
-        return status
+
+
+def parse_video_id(text: str) -> str:
+    """Accept a bare id or any YouTube/Studio URL form."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if "://" not in t and "/" not in t:
+        return t
+    u = urllib.parse.urlparse(t if "://" in t else "https://" + t)
+    q = urllib.parse.parse_qs(u.query)
+    if "v" in q:
+        return q["v"][0]
+    parts = [p for p in u.path.split("/") if p]
+    for marker in ("live", "video", "embed", "shorts"):
+        if marker in parts and parts.index(marker) + 1 < len(parts):
+            return parts[parts.index(marker) + 1]
+    if u.netloc.endswith("youtu.be") and parts:
+        return parts[0]
+    return parts[-1] if parts else ""
+
+
+def _reason(e) -> str:
+    try:
+        data = json.loads(e.content.decode())
+        err = data["error"]
+        reasons = ",".join(x.get("reason", "") for x in err.get("errors", []))
+        return f"{err.get('message', '')} ({reasons})"
+    except Exception:
+        return str(e)

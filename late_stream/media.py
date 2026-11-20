@@ -53,13 +53,14 @@ class AudioInfo:
 
 @dataclass
 class MediaInfo:
-    path: Path
+    path: Path | str  # local path or URL
     duration: float
     size_bytes: int
     format_name: str
     video: VideoInfo
     audio: list[AudioInfo] = field(default_factory=list)
     max_keyframe_interval: float | None = None  # seconds, sampled
+    display_name: str | None = None  # what to show instead of a (secret) URL
 
     @property
     def interlaced(self) -> bool:
@@ -97,7 +98,7 @@ def _parse_rate(rate: str | None) -> float:
         return 0.0
 
 
-def sample_keyframe_interval(path: Path, seconds: float = 120.0) -> float | None:
+def sample_keyframe_interval(path: Path | str, seconds: float = 120.0) -> float | None:
     """Largest gap between keyframes in the first ``seconds`` of the file."""
     data = _run_json([
         "ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -116,13 +117,21 @@ def sample_keyframe_interval(path: Path, seconds: float = 120.0) -> float | None
     return max(b - a for a, b in zip(times, times[1:]))
 
 
-def probe(path: str | Path, check_gop: bool = True) -> MediaInfo:
-    path = Path(path)
-    if not path.is_file():
-        raise ProbeError(f"File not found: {path}")
+def is_url(src) -> bool:
+    return str(src).startswith(("http://", "https://"))
+
+
+def probe(path: str | Path, check_gop: bool = True, size_bytes: int | None = None,
+          display_name: str | None = None) -> MediaInfo:
+    """Probe a local file or an HTTP(S) URL (e.g. a NAS download link)."""
+    src = str(path)
+    if not is_url(src):
+        path = Path(path)
+        if not path.is_file():
+            raise ProbeError(f"File not found: {path}")
     data = _run_json([
         "ffprobe", "-v", "error", "-show_format", "-show_streams",
-        "-of", "json", str(path),
+        "-of", "json", src,
     ])
     streams = data.get("streams", [])
     vstreams = [s for s in streams if s.get("codec_type") == "video"
@@ -150,10 +159,14 @@ def probe(path: str | Path, check_gop: bool = True) -> MediaInfo:
             sample_rate=int(s.get("sample_rate", 0) or 0),
         ))
     fmt = data.get("format", {})
+    size = size_bytes or int(fmt.get("size", 0) or 0)
+    if not size and not is_url(src):
+        size = Path(src).stat().st_size
     info = MediaInfo(
-        path=path,
+        path=path if not is_url(src) else src,  # type: ignore[arg-type]
+        display_name=display_name,
         duration=float(fmt.get("duration", 0) or 0),
-        size_bytes=int(fmt.get("size", 0) or path.stat().st_size),
+        size_bytes=size,
         format_name=fmt.get("format_name", ""),
         video=video,
         audio=audio,
@@ -229,7 +242,7 @@ def human_size(n: int) -> str:
 def describe(info: MediaInfo, plan: DeliveryPlan) -> str:
     v = info.video
     lines = [
-        f"File:       {info.path}",
+        f"File:       {info.display_name or info.path}",
         f"Size:       {human_size(info.size_bytes)}",
         f"Duration:   {info.duration / 3600:.2f} h ({info.duration:.0f} s)",
         f"Container:  {info.format_name}",

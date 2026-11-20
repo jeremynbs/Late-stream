@@ -1,159 +1,188 @@
-# late-stream
+# Late Stream
 
-Stream **pre-recorded video files** to **YouTube Live** on a schedule (a "delayed live
-stream"). The tool uses the YouTube Data API v3 to create the live event and
-ffmpeg to push the file over RTMPS in real time.
+Late Stream is a small web app that plays **recorded videos from a Synology NAS** to
+**YouTube Live** at a scheduled time. It's for "delayed live" broadcasts.
 
-- Accepts **ProRes** (422 / HQ / LT / Proxy / 4444), **H.264**, **HEVC/H.265**, DNxHD/HR,
-  MPEG-2, VP9, AV1, and anything else ffmpeg can decode, in MOV/MP4/MXF/MKV/TS.
-- Files that are already YouTube-ready (H.264 8-bit 4:2:0, keyframes ≤ 4 s) are sent
-  **without re-encoding** (almost no CPU). Everything else is transcoded live to H.264/AAC.
-- Built for large files (80–120 GB). The file is read sequentially at 1× speed and
-  never loaded into memory.
-- Schedules several streams a day. Each job creates its own YouTube broadcast. The
-  stream key is reusable, so it doesn't change between jobs.
-- **Self-healing**: if the connection drops or ffmpeg crashes, it restarts from the last
-  position (up to 20 times). YouTube keeps the broadcast alive through short gaps.
-- Remembers job state, so restarting the service doesn't create duplicate broadcasts.
-- Deinterlaces, downscales (for example 4K → 1080p), caps output at 60 fps, merges mono
-  audio tracks into stereo, and adds a silent track to files with no audio.
+You set up each broadcast in YouTube Studio (title, thumbnail, Public). In Late Stream
+you choose the file on the NAS, the start time, and paste the stream URL and key. At the
+start time the app streams the file over RTMP(S). When the stream ends, it switches the
+video to **Unlisted**. Email alerts tell you when something goes wrong.
 
 ```
-recording.mov ──ffprobe──▶ plan (copy | transcode)
-                              │
- schedule.yaml ─▶ daemon ─▶ YouTube API: liveStreams (reusable key) + liveBroadcasts.insert + bind
-                              │                         at start time
-                              └──────────▶ ffmpeg -re ... -f flv rtmps://a.rtmps.youtube.com/live2/<key>
-                                               (auto-start → LIVE, at end → complete)
+ Synology NAS ──File Station API (HTTPS, range requests)──▶ Late Stream ──RTMPS──▶ YouTube Live
+ (ProRes files)                                             ffmpeg: ProRes → H.264 1080p30
+                                                            web UI · scheduler · email alerts
+                                                                 │
+                                       YouTube Data API (optional) └─▶ after the stream: set Unlisted
 ```
+
+## Features
+
+- **Web UI** for settings and for setting up each stream: NAS file browser, date and time
+  in your time zone, stream URL and key, an optional YouTube link, and an "unlist after"
+  checkbox. Each stream has **Start now**, **Stop**, **Resume** and **Duplicate** buttons.
+- **Reads straight from the NAS** through the File Station API. Nothing is copied
+  locally, so 80–120 GB files need no extra disk. The app uses HTTP range requests, so
+  MOV files with the index at the end work, and it can resume from any point.
+- **Live transcoding** of ProRes (Proxy, LT, 422, HQ, 4444) to H.264 1080p30 with AAC
+  audio, which is what YouTube's RTMP ingest wants. H.264, HEVC, DNxHD and other common
+  codecs are also accepted. Files that are already YouTube-ready are sent without
+  re-encoding.
+- **Starts on time.** The app checks the file 60 minutes before start (configurable). If
+  the check fails, it emails you and keeps retrying every 5 minutes.
+- **Recovers on its own:**
+  - If the connection to the NAS or YouTube drops, it reconnects from the same point,
+    with backoff, for about 18 minutes.
+  - If the NAS session expires, it logs in again.
+  - If the app restarts mid-stream, it resumes automatically when it was down for less
+    than 5 minutes. Otherwise there's a **Resume** button.
+- **No overlaps.** The app rejects a stream whose time overlaps another one, using the
+  real length of the file.
+- **Email alerts.** Failures are always sent: check failed, reconnecting, failed, missed,
+  interrupted, or unlisting failed. Started and finished alerts are optional.
+- **After the stream** it ends the broadcast if YouTube hasn't already, then sets the video
+  to **Unlisted**. This needs YouTube connected; see below. It also starts the broadcast
+  if Auto-start was left off in Studio.
 
 ## Install
 
-Requirements: Python ≥ 3.10 and ffmpeg/ffprobe ≥ 5 on `PATH`. Any OS works (Linux,
-macOS or Windows).
+### Docker (recommended)
 
 ```bash
-pip install -e .            # or: pip install -e '.[dev]' to run tests
-late-stream --help
+git clone … && cd Late-stream
+docker compose up -d --build
+# open http://<this-machine>:8080
 ```
 
-## One-time Google / YouTube setup
+All state (settings, schedule, logs) lives in `./data`. That folder holds the stream keys
+and passwords, so keep it private.
 
-1. **Enable live streaming** on the channel at <https://www.youtube.com/features>. This
-   needs phone verification, and the first activation can take **up to 24 hours**.
-2. Open the **Google Cloud Console** and create a project. Enable **YouTube Data API v3**.
-3. Set up the **OAuth consent screen** (External, or Internal for Workspace). Add the scope
-   `https://www.googleapis.com/auth/youtube`, then click **Publish app** to move it to
-   *In production*.
-   > ⚠️ If the app stays in *Testing*, Google expires the refresh token after **7 days**,
-   > and the unattended daemon stops working. An unverified app in production is fine for
-   > your own channel. You'll just click through an "unverified app" warning once.
-4. Under **Credentials**, create an *OAuth client ID* of type **Desktop app**. Download it
-   as `client_secret.json` next to your schedule file.
-5. Run `late-stream auth -c schedule.yaml` and log in **as the channel owner or manager**.
-   This writes `token.json`. Keep it secret: it gives access to the channel.
+### Without Docker
 
-## Usage
+You need Python 3.10 or newer and **ffmpeg 5 or newer** on your `PATH`.
 
 ```bash
-cp config.example.yaml schedule.yaml      # edit jobs: file, start (with UTC offset), title
-late-stream probe /mnt/rec/session1.mov   # codec report and copy/transcode decision
-late-stream check -c schedule.yaml        # probe every job, find overlaps and missing files
-late-stream daemon -c schedule.yaml       # run as a service; re-reads the file every 30 s
-
-# single job, now, for testing (unlisted/private recommended):
-late-stream run-job -c schedule.yaml 2026-11-21-a --now
-# dry run without YouTube: write what would be sent to a local file
-late-stream run-job -c schedule.yaml 2026-11-21-a --now --output /tmp/test.flv
-
-# optional: pre-convert ProRes to a small YouTube-ready MP4 ahead of time
-late-stream prepare /mnt/rec/session1.mov -o /mnt/rec/session1.mp4 --preset medium
+pip install .
+late-stream serve --data-dir ./data --port 8080
 ```
 
-To run the daemon as a service on Linux, use systemd:
+On Linux you can run it as a systemd service: `ExecStart=/usr/local/bin/late-stream serve
+--data-dir /var/lib/late-stream`, with `Restart=always`.
 
-```ini
-# /etc/systemd/system/late-stream.service
-[Service]
-WorkingDirectory=/opt/late-stream
-ExecStart=/usr/local/bin/late-stream daemon -c /opt/late-stream/schedule.yaml
-Restart=always
-User=streamer
-[Install]
-WantedBy=multi-user.target
-```
+### Where to run it
 
-Logs go to `logs/late-stream.log`, and each job writes its ffmpeg log to `logs/<job-id>/`.
-`state.json` shows each job's status (`scheduled`, `live`, `done`, `failed` or `missed`)
-and its watch URL.
+Run it on a machine on the **same LAN as the NAS**, such as a mini PC or a small server.
+
+- **CPU:** live H.264 encoding of 1080p30 needs about **2–4 modern CPU cores**. In a test,
+  ProRes Proxy 1080p30 encoded at 3.2× real time on 4 cores. Machines with an Intel CPU
+  can use **Quick Sync** (`h264_qsv`), and NVIDIA GPUs can use **NVENC**. Both need
+  almost no CPU. Set this in Settings → Encoder.
+- **Running on the NAS itself:** most Synology CPUs are too weak to encode 1080p live, so
+  only run it in Container Manager on a model with a strong CPU.
+- **Network:** the app pulls about 45 Mbps from the NAS (fine on 1 GbE). It sends about
+  **8.5 Mbps** to YouTube, so you need **at least 15–20 Mbps of stable upload**. Use a
+  wired connection and a UPS.
+
+## First-time setup (in the web UI)
+
+1. **Admin password and time zone.** Set them when the page first opens. Keep the UI on
+   your LAN and don't port-forward it.
+2. **Settings → Synology NAS.**
+   - In DSM, create a user (for example `streamer`). Give it **read-only** access to the
+     recordings shared folder and permission for the File Station application.
+   - **Turn off 2-step verification** for this user, because the app logs in by itself.
+   - Address: `https://<nas-ip>:5001`. Leave "Verify certificate" off if the NAS uses
+     Synology's self-signed certificate.
+   - Click **Save & test connection**.
+3. **Settings → Email alerts.** Enter your SMTP server. For Gmail: `smtp.gmail.com`, port
+   587, STARTTLS, and a Google **App password**. Click **Save & send test email**.
+4. **Settings → YouTube.** This is optional but needed for the automatic switch to
+   Unlisted:
+   1. In Google Cloud Console, create a project and enable **YouTube Data API v3**.
+   2. On the **OAuth consent screen**, add the scope `.../auth/youtube` and **publish**
+      the app. In "Testing" mode Google expires the login every 7 days. You'll see an
+      "unverified app" warning once; that's fine for your own channel.
+   3. Under **Credentials**, create an OAuth client ID of type **Desktop app** and download
+      the JSON.
+   4. Upload the JSON, click **Connect YouTube**, and log in as the channel owner.
+   5. If the browser then shows "can't be reached", the browser isn't on the same machine
+      as the app. Paste the address from the address bar into the box under the button.
+5. **Settings → Encoder.** The defaults are H.264 1080p, 8000 kbps, 2 s keyframes and
+   160 kbps AAC. They suit ProRes Proxy 1080p30.
+
+## Each stream
+
+1. In **YouTube Studio**, go to Create → Go live → **Schedule stream**. Set the title,
+   description and thumbnail, and set **Public**.
+2. In the stream settings, turn on **Auto-start** and **Auto-stop**. Pick a stream key;
+   a reusable key is fine because the streams never overlap.
+3. In **Late Stream**, click **New stream**:
+   - Name.
+   - **Browse…** the NAS and pick the file.
+   - Date and time.
+   - Paste the **Stream URL** (`rtmps://a.rtmps.youtube.com/live2` by default) and the
+     **Stream key**.
+   - Leave "Change the video to Unlisted when the stream ends" ticked. You can paste the
+     YouTube link; if you don't, it's found from the stream key.
+4. Save. The app checks the file and shows its codec and length. At the start time it goes
+   live by itself.
+
+Use **Duplicate** to create the next day's streams quickly. The stream key is copied
+over.
 
 ## API cost
 
-**The YouTube Data API costs no money.** Google limits it by a quota instead: each
-project gets **10,000 units per day** (resets at midnight Pacific time). You can request
-more for free through the quota extension form, which involves a compliance audit.
+The **YouTube Data API costs no money**. Google limits it by a quota instead: each project
+gets **10,000 units per day**. Late Stream uses the API only after the stream starts, and
+only when YouTube is connected:
 
-| Call | Units | Per stream |
+| Step | Calls | Units |
 |---|---|---|
-| `liveStreams.list` (find the reusable key) | 1 | 1 |
-| `liveStreams.insert` (first time only, key reused afterwards) | 50 | 0 |
-| `liveBroadcasts.insert` (create event) | 50 | 50 |
-| `liveBroadcasts.bind` | 50 | 50 |
-| `thumbnails.set` (optional) | 50 | 0–50 |
-| `liveBroadcasts.list` (status checks) | 1 | ~2 |
-| `liveBroadcasts.transition` → complete | 50 | 50 |
-| `videos.update` (only if `category_id` set) | 50 | 0–50 |
-| manual go-live (`auto_start: false`): polls + transition | 1 each + 50 | ~0–90 |
-| **Typical total** | | **≈ 150–300** |
+| Find the broadcast for the stream key | `liveStreams.list` + `liveBroadcasts.list` | 2 |
+| Check it went live | `liveBroadcasts.list` | 1 |
+| Wait for Auto-stop to end it | `liveBroadcasts.list` × 1–10 | 1–10 |
+| Set Unlisted | `videos.list` + `videos.update` | 51 |
+| *Only if Auto-stop didn't end it* | `liveBroadcasts.transition` → complete | +50 |
+| *Only if Auto-start was off* | `liveBroadcasts.transition` (testing/live) | +50–100 |
+| **Typical per stream** | | **≈ 55–65** (worst case ≈ 215) |
 
-**3 streams/day ≈ 450–900 units/day, which is under 10% of the free quota.** You never
-need to pay for quota. Video ingest, transcoding on YouTube's side and archiving the
-stream as a VOD are also free.
+**3 streams per day ≈ 200 units, about 2% of the free quota.** If you don't connect
+YouTube, the app uses 0 units: RTMP streaming itself never touches the API.
 
 The real costs are your own infrastructure:
 
-| Item | Estimate |
-|---|---|
-| Upload bandwidth | 1080p: 6–9 Mbps per stream (have ≥ 20 Mbps of stable upload). 4K: 25–35 Mbps (have ≥ 60 Mbps). |
-| Data sent | ~3–4 GB per hour of 1080p. With 3 streams/day that's ≈ 10–15 GB/day. |
-| Cloud VM egress (if used) | ≈ $0.08–0.12/GB → ≈ $1–2/day for 3 × 1 h at 1080p |
-| Storage | 3 × 80–120 GB = **240–360 GB/day**, or ≈ 7–11 TB/month if you keep the masters |
-| Compute | See sizing below |
+- **Upload data.** 8.5 Mbps × 4–6 h × 3 streams ≈ **45–70 GB per day**, or about
+  1.4–2 TB per month. Check whether your ISP has a data cap.
+- **Electricity and hardware** for the machine that runs the app.
 
-## Sizing for 80–120 GB recordings
+## Sizing for your recordings
 
-How long a file lasts depends on the codec:
+ProRes Proxy 1080p30 runs at about 45 Mbps, so **80–120 GB lasts about 4–6 hours**.
+YouTube only archives live streams of up to **12 hours** as a VOD, so these fit.
 
-| Source | Bitrate | 100 GB lasts |
-|---|---|---|
-| ProRes 422 HQ 1080p30 | ~220 Mbps | ~1 h |
-| ProRes 422 1080p30 | ~147 Mbps | ~1.5 h |
-| ProRes 422 HQ 2160p30 | ~707 Mbps | ~20 min |
-| H.264 50 Mbps (camera) | 50 Mbps | ~4.4 h |
+## Limits
 
-- **Disk read** at 1× speed is ≤ 90 MB/s even for 4K ProRes HQ, so any SSD, RAID or 10 GbE
-  NAS works. A 1 GbE NAS handles 1080p ProRes but is tight for 4K ProRes HQ.
-- **CPU for live transcoding** with `libx264 veryfast`: 1080p30 needs about 4–6 modern
-  cores. 4K→1080p from ProRes needs about 8+ cores. For 4K output, or to leave plenty of
-  headroom, use a GPU (`video_encoder: h264_nvenc` on NVIDIA, `h264_qsv` on Intel, or
-  `h264_videotoolbox` on a Mac). The log warns if encoding falls below real time.
-- **Most robust option:** run `late-stream prepare` on the ProRes file as soon as the
-  recording ends. A 1 h ProRes HQ file (~100 GB) becomes a ~3–5 GB H.264 file that streams
-  with `-c copy` and needs almost no CPU. That also makes it practical to stream from a
-  cheap cloud VM, because you upload 4 GB instead of 100 GB.
-- Run the machine on a wired connection with a UPS. Keep its clock NTP-synced.
+- **Content ID still applies.** Third-party music can get a stream blocked.
+- **Stop button:** stopping a stream doesn't end or unlist the YouTube broadcast. Use
+  Resume, or end it in Studio.
+- **Secrets:** the stream key and passwords are stored in `data/late-stream.db`, which
+  only the app's user can read. The UI never shows the full stream key again after it's
+  saved.
 
-## Notes and limits
+## Command-line tools
 
-- YouTube only archives a live stream as a VOD if it's **12 hours or shorter**.
-- Rerunning pre-recorded content as "live" is allowed. **Content ID still applies**, and
-  third-party music can get the stream cut off or blocked.
-- If two jobs overlap, give them different `ingest_stream` names. `check` catches this.
-- `auto_start: true` makes the event go live as soon as video arrives at the start time.
-  `latency: normal` gives the best quality and enables DVR.
+```bash
+late-stream probe FILE_OR_URL     # codec report and how it would be streamed
+late-stream prepare IN.mov -o OUT.mp4 --preset medium   # optional offline pre-conversion
+```
 
 ## Development
 
 ```bash
-pip install -e '.[dev]' && pytest     # builds tiny ProRes/H.264/HEVC test clips with ffmpeg
+pip install -e '.[dev]' && pytest
 ```
+
+The tests create small ProRes, H.264 and HEVC clips with ffmpeg. They include a fake
+Synology File Station server, which also tests dropped connections and expired sessions.
+They push to a real local RTMP server and check the scheduler, recovery, email and
+YouTube flows, and the web UI.

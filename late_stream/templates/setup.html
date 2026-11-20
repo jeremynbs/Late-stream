@@ -1,0 +1,13 @@
+{% extends "base.html" %}{% block body %}
+<div class="card center"><h1>Welcome to Late Stream</h1>
+<p class="muted">Create the admin password for this web interface.</p>
+<form method="post">
+<label>Password</label><input type="password" name="password" required minlength="8" autofocus>
+<label>Repeat password</label><input type="password" name="password2" required minlength="8">
+<label>Your time zone</label>
+<select name="timezone" id="tz">{% for z in timezones %}<option {{ 'selected' if z=='UTC' }}>{{ z }}</option>{% endfor %}</select>
+<p><button class="primary">Create</button></p></form></div>
+{% endblock %}
+{% block scripts %}<script>
+try{const z=Intl.DateTimeFormat().resolvedOptions().timeZone;const o=[...document.getElementById('tz').options].find(o=>o.value===z);if(o)o.selected=true;}catch(e){}
+</script>{% endblock %}

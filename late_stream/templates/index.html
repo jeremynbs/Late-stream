@@ -1,0 +1,32 @@
+{% extends "base.html" %}{% block body %}
+<div class="row"><h1 class="grow">Streams</h1><span class="muted">{{ now }}</span>
+<a class="btn primary" href="{{ url_for('stream_new') }}">+ New stream</a></div>
+{% for w in warnings %}<div class="flash warn">{{ w }} <a href="{{ url_for('settings_page') }}">Settings</a></div>{% endfor %}
+<div class="card"><h2>Upcoming &amp; live</h2>
+{% if upcoming %}<table class="streams"><thead><tr><th>Stream</th><th>Start ({{ tzname }})</th><th>Status</th><th></th></tr></thead><tbody>
+{% for s in upcoming %}{% include "_row.html" %}{% endfor %}</tbody></table>
+{% else %}<p class="muted">Nothing scheduled. Click “New stream”.</p>{% endif %}</div>
+<div class="card"><h2>History</h2>
+{% if past %}<table class="streams"><thead><tr><th>Stream</th><th>Start</th><th>Result</th><th></th></tr></thead><tbody>
+{% for s in past %}{% include "_row.html" %}{% endfor %}</tbody></table>
+{% else %}<p class="muted">No finished streams yet.</p>{% endif %}</div>
+{% endblock %}
+{% block scripts %}<script>
+let lastStatuses=null;
+async function refresh(){
+  try{
+    const r=await fetch('/api/streams'); if(!r.ok) return;
+    const list=await r.json(); const sig=list.map(s=>s.id+s.status+s.running).join();
+    if(lastStatuses!==null && sig!==lastStatuses){location.reload();return;}
+    lastStatuses=sig;
+    for(const s of list){
+      const tr=document.querySelector(`tr[data-id="${s.id}"]`); if(!tr) continue;
+      const p=tr.querySelector('[data-f=progress]'), b=tr.querySelector('[data-f=bar]'), m=tr.querySelector('[data-f=message]');
+      if(p && (s.status==='live'||s.position)) p.textContent=`${s.position_hms} / ${s.duration_hms}`+(s.status==='live'&&s.speed?`  (${s.speed})`:'');
+      if(b) b.style.width=s.percent+'%';
+      if(m) m.textContent=(s.message||'').slice(0,140);
+    }
+  }catch(e){}
+}
+refresh(); setInterval(refresh,5000);
+</script>{% endblock %}

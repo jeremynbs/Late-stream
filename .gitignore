@@ -3,9 +3,6 @@ __pycache__/
 *.egg-info/
 .venv/
 .pytest_cache/
-# secrets / runtime state
-client_secret*.json
-token*.json
-state.json
-logs/
+# runtime data: database holds stream keys and passwords
+data/
 *.flv

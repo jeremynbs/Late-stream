@@ -1,0 +1,15 @@
+services:
+  late-stream:
+    build: .
+    container_name: late-stream
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data        # database (settings, schedule, secrets) + logs
+    stop_grace_period: 30s
+    # NVIDIA GPU encoding (select "NVIDIA GPU (NVENC)" in Settings > Encoder):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{ driver: nvidia, count: 1, capabilities: [gpu, video] }]

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .media import DeliveryPlan, MediaInfo
 
@@ -101,6 +103,7 @@ def build_ffmpeg_command(
     start_offset: float = 0.0,
     realtime: bool = True,
     output_format: str = "flv",
+    input_url: str | None = None,
 ) -> list[str]:
     """Return the ffmpeg argv that sends ``info.path`` to ``output``.
 
@@ -113,7 +116,12 @@ def build_ffmpeg_command(
         cmd += ["-re"]
     if start_offset > 0:
         cmd += ["-ss", f"{start_offset:.3f}"]
-    cmd += ["-i", str(info.path)]
+    src = input_url or str(info.path)
+    if src.startswith(("http://", "https://")):
+        # Survive short NAS/network hiccups without dropping the stream.
+        cmd += ["-reconnect", "1", "-reconnect_on_network_error", "1",
+                "-reconnect_delay_max", "10", "-rw_timeout", "30000000"]
+    cmd += ["-i", src]
 
     silent = not info.audio
     if silent:
@@ -164,13 +172,14 @@ def build_ffmpeg_command(
 
 
 def redact(cmd: list[str]) -> str:
-    """Command line for logs, without the stream key."""
+    """Command line for logs, without the stream key or NAS session id."""
+    from .nas import redact_url
     out = []
     for a in cmd:
         if a.startswith(("rtmp://", "rtmps://")):
             out.append(a.rsplit("/", 1)[0] + "/<stream-key>")
         else:
-            out.append(a)
+            out.append(redact_url(a))
     return " ".join(out)
 
 
@@ -194,9 +203,12 @@ class StreamRunner:
     connection drops (YouTube keeps a broadcast alive through short outages)."""
 
     def __init__(self, info: MediaInfo, plan: DeliveryPlan, settings: EncoderSettings,
-                 output: str, *, max_restarts: int = 20, restart_delay: float = 3.0,
+                 output: str, *, max_restarts: int = 40, restart_delay: float = 3.0,
                  stall_timeout: float = 60.0, log_dir: Path | None = None,
-                 realtime: bool = True):
+                 realtime: bool = True,
+                 input_provider: Callable[[], str] | None = None,
+                 on_progress: Callable[[float, str], None] | None = None,
+                 on_restart: Callable[[int, float, int, str], None] | None = None):
         self.info, self.plan, self.settings = info, plan, settings
         self.output = output
         self.max_restarts = max_restarts
@@ -204,6 +216,11 @@ class StreamRunner:
         self.stall_timeout = stall_timeout
         self.log_dir = log_dir
         self.realtime = realtime
+        # Called before every (re)start: lets the caller hand over a fresh
+        # NAS URL (new session id) after a failure.
+        self.input_provider = input_provider
+        self.on_progress = on_progress
+        self.on_restart = on_restart
         self.stop_event = threading.Event()
         self.progress = _Progress()
         self.proc: subprocess.Popen | None = None
@@ -225,32 +242,54 @@ class StreamRunner:
             elif key == "speed":
                 self.progress.speed = val
 
-    def run(self) -> StreamResult:
+    def run(self, start_offset: float = 0.0) -> StreamResult:
         restarts = 0
-        offset = 0.0
+        offset = max(0.0, start_offset)
         duration = self.info.duration
         while not self.stop_event.is_set():
+            try:
+                input_url = self.input_provider() if self.input_provider else None
+            except Exception as e:  # NAS unreachable etc.
+                input_url = None
+                err = f"could not get input: {e}"
+                log.error(err)
+                restarts += 1
+                if self.on_restart:
+                    self.on_restart(-1, offset, restarts, err)
+                if restarts > self.max_restarts:
+                    return StreamResult(False, offset, restarts, err)
+                self.stop_event.wait(max(self.restart_delay, 10))
+                continue
             cmd = build_ffmpeg_command(self.info, self.plan, self.settings, self.output,
-                                       start_offset=offset, realtime=self.realtime)
+                                       start_offset=offset, realtime=self.realtime,
+                                       input_url=input_url)
             log.info("starting ffmpeg at %.1fs: %s", offset, redact(cmd))
-            stderr_target = subprocess.PIPE
-            log_file = None
+            # stderr always goes to a file: an undrained pipe would block
+            # ffmpeg after a few hours of warnings.
             if self.log_dir:
                 self.log_dir.mkdir(parents=True, exist_ok=True)
-                log_file = open(self.log_dir / f"ffmpeg-{int(time.time())}.log", "w")
-                stderr_target = log_file
+                log_file = open(self.log_dir / f"ffmpeg-{int(time.time())}.log", "w+")
+            else:
+                log_file = tempfile.TemporaryFile("w+")
             started = time.monotonic()
             self.progress = _Progress(position=offset)
-            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr_target,
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log_file,
                                          text=True, bufsize=1)
             reader = threading.Thread(target=self._read_progress,
                                       args=(self.proc, offset), daemon=True)
             reader.start()
             last_report = started
+            last_cb = 0.0
             while self.proc.poll() is None:
                 if self.stop_event.wait(1.0):
                     break
                 now = time.monotonic()
+                if self.on_progress and now - last_cb >= 5:
+                    last_cb = now
+                    try:
+                        self.on_progress(self.progress.position, self.progress.speed)
+                    except Exception:
+                        log.exception("progress callback failed")
                 if now - self.progress.last_update > self.stall_timeout:
                     log.error("ffmpeg made no progress for %.0fs; killing", self.stall_timeout)
                     self.proc.kill()
@@ -270,11 +309,12 @@ class StreamRunner:
                 self.proc.terminate()
             rc = self.proc.wait()
             reader.join(timeout=5)
-            stderr_tail = ""
-            if log_file:
-                log_file.close()
-            elif self.proc.stderr:
-                stderr_tail = self.proc.stderr.read()[-2000:]
+            log_file.flush()
+            log_file.seek(0)
+            stderr_tail = log_file.read()[-1500:]
+            log_file.close()
+            from .nas import redact_url
+            stderr_tail = redact_url(stderr_tail)
             pos = self.progress.position
 
             if self.stop_event.is_set():
@@ -289,14 +329,21 @@ class StreamRunner:
                 restarts = 0
             restarts += 1
             log.warning("ffmpeg exited rc=%s at %s. %s", rc, _hms(pos), stderr_tail.strip())
+            if self.on_restart:
+                try:
+                    self.on_restart(rc, pos, restarts, stderr_tail.strip())
+                except Exception:
+                    log.exception("restart callback failed")
             if restarts > self.max_restarts:
                 return StreamResult(False, pos, restarts, f"giving up after {restarts - 1} restarts")
             if duration and pos >= duration - 1:
                 return StreamResult(True, pos, restarts, "finished (ffmpeg rc != 0 at end)")
             offset = max(0.0, pos)
-            log.info("restarting in %.0fs (attempt %d/%d)", self.restart_delay,
-                     restarts, self.max_restarts)
-            self.stop_event.wait(self.restart_delay)
+            # Back off 3 s, 6 s, 9 s ... capped at 30 s: 40 attempts ~= 18 min,
+            # enough to ride out a router reboot or ISP hiccup.
+            delay = min(self.restart_delay * restarts, 30.0)
+            log.info("restarting in %.0fs (attempt %d/%d)", delay, restarts, self.max_restarts)
+            self.stop_event.wait(delay)
         return StreamResult(False, self.progress.position, restarts, "stopped")
 
 

@@ -1,0 +1,87 @@
+{% extends "base.html" %}{% block body %}
+<h1>Settings</h1>
+<nav class="tabs muted"><a href="#nas">NAS</a><a href="#email">Email alerts</a><a href="#youtube">YouTube</a><a href="#encoder">Encoder</a><a href="#general">General</a></nav><br>
+
+<div class="card" id="nas"><h2>Synology NAS</h2>
+<form method="post" action="{{ url_for('settings_save', section='nas') }}" autocomplete="off">
+<input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<p class="muted">Use a dedicated DSM user with <b>read-only</b> access to the recordings folder, File Station permission, and <b>no 2-step verification</b>.</p>
+<label>NAS address</label><input type="text" name="nas_url" value="{{ st.nas_url }}" placeholder="https://192.168.1.10:5001">
+<div class="grid2">
+<div><label>DSM user</label><input type="text" name="nas_user" value="{{ st.nas_user }}"></div>
+<div><label>Password</label><input type="password" name="nas_password" placeholder="{{ '•••••••• (saved, leave empty to keep)' if st.nas_password else '' }}"></div>
+</div>
+<label>Start folder for the file browser</label><input class="mono" type="text" name="nas_root" value="{{ st.nas_root }}" placeholder="/video">
+<label class="check"><input type="checkbox" name="nas_verify_tls" {{ 'checked' if st.nas_verify_tls }}> Verify HTTPS certificate (turn off for Synology's default self-signed certificate)</label>
+<p class="row"><button class="primary" name="action" value="save">Save</button><button name="action" value="test">Save &amp; test connection</button></p>
+</form></div>
+
+<div class="card" id="email"><h2>Email alerts</h2>
+<form method="post" action="{{ url_for('settings_save', section='email') }}" autocomplete="off">
+<input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<p class="muted">Alerts are always sent for failures (file check failed, stream dropped, failed, missed, couldn't unlist). For Gmail use smtp.gmail.com, port 587, STARTTLS and an <i>App password</i>.</p>
+<div class="grid2">
+<div><label>SMTP server</label><input type="text" name="smtp_host" value="{{ st.smtp_host }}" placeholder="smtp.gmail.com"></div>
+<div class="grid2"><div><label>Port</label><input type="number" name="smtp_port" value="{{ st.smtp_port }}"></div>
+<div><label>Security</label><select name="smtp_security">{% for v in ['starttls','ssl','none'] %}<option {{ 'selected' if st.smtp_security==v }}>{{ v }}</option>{% endfor %}</select></div></div>
+<div><label>SMTP user</label><input type="text" name="smtp_user" value="{{ st.smtp_user }}"></div>
+<div><label>SMTP password</label><input type="password" name="smtp_password" placeholder="{{ '•••••••• (saved, leave empty to keep)' if st.smtp_password else '' }}"></div>
+<div><label>From address</label><input type="text" name="smtp_from" value="{{ st.smtp_from }}" placeholder="defaults to the SMTP user"></div>
+<div><label>Send alerts to <span class="muted">(comma separated)</span></label><input type="text" name="alert_to" value="{{ st.alert_to }}"></div>
+</div>
+<label class="check"><input type="checkbox" name="notify_start" {{ 'checked' if st.notify_start }}> Also email when a stream starts</label>
+<label class="check"><input type="checkbox" name="notify_finish" {{ 'checked' if st.notify_finish }}> Also email when a stream finishes</label>
+<p class="row"><button class="primary" name="action" value="save">Save</button><button name="action" value="test">Save &amp; send test email</button></p>
+</form></div>
+
+<div class="card" id="youtube"><h2>YouTube (optional)</h2>
+<p class="muted">Streaming only needs the stream key. Connecting YouTube lets the app <b>switch the video to Unlisted after the stream</b>, and start the broadcast if Auto-start was left off. Uses about 60 of the free 10,000 daily API units per stream.</p>
+{% if st.youtube_token_json %}
+<p>Connected to channel: <b>{{ st.youtube_channel }}</b></p>
+<form method="post" action="{{ url_for('youtube_disconnect') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="danger">Disconnect</button></form>
+{% else %}
+<ol class="muted">
+<li>In Google Cloud Console: create a project, enable <b>YouTube Data API v3</b>.</li>
+<li>OAuth consent screen: add the scope <span class="mono">…/auth/youtube</span> and <b>Publish app</b> (in “Testing” mode the login expires every 7 days).</li>
+<li>Credentials → Create OAuth client ID → <b>Desktop app</b> → download the JSON.</li>
+<li>Upload it below and click Connect. Log in as the channel owner.</li>
+</ol>
+<form method="post" action="{{ url_for('youtube_connect') }}" enctype="multipart/form-data">
+<input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<label>OAuth client file (client_secret_….json)</label><input type="file" name="client_file" accept=".json,application/json">
+{% if yt_client %}<p class="muted">Saved client: <span class="mono">{{ yt_client[:24] }}…</span></p>{% endif %}
+<p><button class="primary">Connect YouTube</button></p></form>
+<details><summary class="muted">The browser showed “This site can't be reached” after logging in?</summary>
+<p class="muted">Google sends you back to <span class="mono">{{ redirect_uri }}</span>, which only works when the browser runs on the same computer as this app. Otherwise copy the whole address from the browser's address bar and paste it here:</p>
+<form method="post" action="{{ url_for('youtube_finish') }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<input class="mono" type="text" name="callback_url" placeholder="http://localhost:…/oauth/callback?state=…&code=…">
+<p><button>Finish connecting</button></p></form></details>
+{% endif %}
+</div>
+
+<div class="card" id="encoder"><h2>Encoder</h2>
+<form method="post" action="{{ url_for('settings_save', section='encoder') }}">
+<input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<p class="muted">ProRes is converted live to H.264 for YouTube. Defaults suit 1080p30 ProRes Proxy.</p>
+<div class="grid2">
+<div><label>Video encoder</label><select name="video_encoder">{% for v,l in encoders %}<option value="{{ v }}" {{ 'selected' if st.video_encoder==v }}>{{ l }}</option>{% endfor %}</select></div>
+<div><label>Preset <span class="muted">(CPU only — faster uses less CPU)</span></label><select name="preset">{% for p in presets %}<option {{ 'selected' if st.preset==p }}>{{ p }}</option>{% endfor %}</select></div>
+<div><label>Output height</label><select name="height">{% for h in [1080,720] %}<option {{ 'selected' if st.height==h }}>{{ h }}</option>{% endfor %}</select></div>
+<div><label>Video bitrate (kbps)</label><input type="number" name="video_bitrate_kbps" value="{{ st.video_bitrate_kbps }}" min="1000" max="51000"></div>
+<div><label>Audio bitrate (kbps)</label><input type="number" name="audio_bitrate_kbps" value="{{ st.audio_bitrate_kbps }}" min="64" max="320"></div>
+<div><label>Keyframe interval (s)</label><input type="number" name="keyframe_seconds" value="{{ st.keyframe_seconds }}" min="1" max="4" step="1"></div>
+</div>
+<p><button class="primary">Save</button></p></form></div>
+
+<div class="card" id="general"><h2>General</h2>
+<form method="post" action="{{ url_for('settings_save', section='general') }}" autocomplete="off">
+<input type="hidden" name="csrf" value="{{ csrf_token() }}">
+<div class="grid2">
+<div><label>Time zone</label><select name="timezone">{% for z in timezones %}<option {{ 'selected' if st.timezone==z }}>{{ z }}</option>{% endfor %}</select></div>
+<div><label>Default stream URL</label><input class="mono" type="text" name="default_rtmp_url" value="{{ st.default_rtmp_url }}"></div>
+<div><label>Check the file this many minutes before start</label><input type="number" name="preflight_minutes" value="{{ st.preflight_minutes }}" min="5"></div>
+<div><label>If the app was down at start time, still start up to (minutes late)</label><input type="number" name="max_late_minutes" value="{{ st.max_late_minutes }}" min="0"></div>
+<div><label>New admin password <span class="muted">(optional)</span></label><input type="password" name="new_password" minlength="8"></div>
+</div>
+<p><button class="primary">Save</button></p></form></div>
+{% endblock %}
